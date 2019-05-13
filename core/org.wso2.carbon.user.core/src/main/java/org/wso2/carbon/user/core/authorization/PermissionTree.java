@@ -29,23 +29,20 @@ import org.wso2.carbon.user.core.util.DatabaseUtil;
 import org.wso2.carbon.user.core.util.UserCoreUtil;
 import org.wso2.carbon.utils.xml.StringUtils;
 
-import javax.cache.Cache;
-import javax.cache.CacheManager;
-import javax.cache.Caching;
-import javax.sql.DataSource;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
-
-import static org.wso2.carbon.caching.impl.CachingConstants.ILLEGAL_STATE_EXCEPTION_MESSAGE;
+import javax.cache.Cache;
+import javax.cache.CacheManager;
+import javax.cache.Caching;
+import javax.sql.DataSource;
 
 public class PermissionTree {
 
@@ -996,30 +993,35 @@ public class PermissionTree {
                 } else {
                     if(!StringUtils.isEmpty(resourceId)) {
                         //If permission tree is cached, only update the permissions of given resource path
-                        updateResourcePermissionsById(resourceId);
+                        synchronized (this) {
+                            updateResourcePermissionsById(resourceId);
+                            cacheEntry.setResource(root);
+                        }
                     }
                 }
             } else {
                 synchronized (this) {
-                    updatePermissionTreeFromDB();
-                    cacheKey = new PermissionTreeCacheKey(cacheIdentifier, tenantId);
-                    cacheEntry = new GhostResource<TreeNode>(root);
-                    try {
-                        permissionCache.put(cacheKey, cacheEntry);
-                    } catch (IllegalStateException e) {
-                        if (e.getMessage().contains(ILLEGAL_STATE_EXCEPTION_MESSAGE)) {
-                            if (log.isDebugEnabled()) {
-                                log.debug("Error when trying to put an entry to permissionCache. Retrying..");
-                            }
-                            permissionCache = this.getPermissionTreeCache();
+                    cacheEntry = (GhostResource<TreeNode>) permissionCache.get(cacheKey);
+                    if (cacheEntry == null || cacheEntry.getResource() == null) {
+                        updatePermissionTreeFromDB();
+                        cacheKey = new PermissionTreeCacheKey(cacheIdentifier, tenantId);
+                        cacheEntry = new GhostResource<TreeNode>(root);
+                        try {
                             permissionCache.put(cacheKey, cacheEntry);
-                        } else {
-                            // We only handle a specific IllegalStateException.
-                            throw e;
+                        } catch (IllegalStateException e) {
+                            // There is no harm ignoring cache update. as the local cache is already of no use.
+                            // Mis-penalty is low.
+                            String msg = "Error occurred while adding the permission tree to cache while trying to update" +
+                                    " resource: " + resourceId + " in tenant: " + tenantId;
+                            log.warn(msg);
+                            if (log.isDebugEnabled()) {
+                                log.debug(msg, e);
+                            }
                         }
-                    }
-                    if (log.isDebugEnabled()) {
-                        log.debug("Loaded from database");
+                        if (log.isDebugEnabled()) {
+                            log.debug("Permission tree is loaded from database for the resource " + resourceId +
+                                    " in tenant " + tenantId);
+                        }
                     }
                 }
             }
@@ -1040,7 +1042,12 @@ public class PermissionTree {
             tree.root = this.root;
             dbConnection = getDBConnection();
             // Populating role permissions
-            statement = dbConnection.prepareStatement(DBConstants.GET_EXISTING_ROLE_PERMISSIONS_BY_RESOURCE_ID);
+            if (preserveCaseForResources) {
+                statement = dbConnection.prepareStatement(DBConstants.GET_EXISTING_ROLE_PERMISSIONS_BY_RESOURCE_ID_CASE_SENSITIVE);
+            } else {
+                statement = dbConnection.prepareStatement(DBConstants.GET_EXISTING_ROLE_PERMISSIONS_BY_RESOURCE_ID);
+            }
+
             statement.setInt(1, tenantId);
             statement.setInt(2, tenantId);
             statement.setString(3, resourceId);
@@ -1057,6 +1064,7 @@ public class PermissionTree {
                     }
                 }
             } finally {
+                this.root = tree.root;
                 write.unlock();
             }
         } catch (SQLException e) {
